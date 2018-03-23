@@ -11,7 +11,9 @@ use Generated\Shared\Transfer\CartChangeTransfer;
 use Generated\Shared\Transfer\CartPreCheckResponseTransfer;
 use Generated\Shared\Transfer\ItemTransfer;
 use Generated\Shared\Transfer\MessageTransfer;
+use Generated\Shared\Transfer\QuoteTransfer;
 use Orm\Zed\Product\Persistence\SpyProductQuery;
+use Orm\Zed\ProductQuantity\Persistence\SpyProductQuantity;
 
 class ProductQuantityRestrictionValidator implements ProductQuantityRestrictionValidatorInterface
 {
@@ -24,34 +26,10 @@ class ProductQuantityRestrictionValidator implements ProductQuantityRestrictionV
     {
         $responseTransfer = new CartPreCheckResponseTransfer();
 
-        $changedProductConcreteSkus = [];
         foreach ($cartChangeTransfer->getItems() as $itemTransfer) {
-            $changedProductConcreteSkus[] = $itemTransfer->getSku();
-        }
-
-        $quoteProductQuantityMap = [];
-        foreach ($cartChangeTransfer->getQuote()->getItems() as $itemTransfer) {
-            $quoteProductQuantityMap[$itemTransfer->getSku()] = $itemTransfer->getQuantity();
-        }
-
-        $productQuantityRestrictionCollection = $this->getProductQuantityRestrictionCollection($changedProductConcreteSkus);
-
-        foreach ($cartChangeTransfer->getItems() as $itemTransfer) {
-            $productConcreteSku = $itemTransfer->getSku();
-            $productConcreteQuoteQuantity = isset($quoteProductQuantityMap[$productConcreteSku]) ? $quoteProductQuantityMap[$productConcreteSku] : 0;
-            $productConcreteQuantity = $itemTransfer->getQuantity() + $productConcreteQuoteQuantity;
-            $min = $productQuantityRestrictionCollection[$productConcreteSku]['min'];
-            $max = $productQuantityRestrictionCollection[$productConcreteSku]['max'];
-            $interval = $productQuantityRestrictionCollection[$productConcreteSku]['interval'];
-
-            if ($productConcreteQuantity < $min) {
-                $this->createViolationMessage($itemTransfer, $responseTransfer);
-            }
-            if ($max !== null && $productConcreteQuantity > $max) {
-                $this->createViolationMessage($itemTransfer, $responseTransfer);
-            }
-            if (!is_int($productConcreteQuantity / $interval)) {
-                $this->createViolationMessage($itemTransfer, $responseTransfer);
+            if ($itemTransfer->getSku()) {
+                $this->validateItem($itemTransfer, $cartChangeTransfer->getQuote(), $responseTransfer);
+                continue;
             }
         }
 
@@ -59,50 +37,128 @@ class ProductQuantityRestrictionValidator implements ProductQuantityRestrictionV
     }
 
     /**
-     * @param string[] $productConcreteSkus
-     *
-     * @return array
-     */
-    protected function getProductQuantityRestrictionCollection(array $productConcreteSkus)
-    {
-        /** @var \Orm\Zed\Product\Persistence\SpyProduct[] $productCollection */
-        $productCollection = SpyProductQuery::create()
-            ->filterBySku_In($productConcreteSkus)
-            ->leftJoinWithSpyProductQuantity()
-            ->find()
-            ->getArrayCopy();
-
-        $productQuantityRestrictionCollection = [];
-        foreach ($productCollection as $productEntity) {
-            /** @var \Orm\Zed\ProductQuantity\Persistence\SpyProductQuantity $productQuantityEntity */
-            $productQuantityEntity = $productEntity->getSpyProductQuantities()->getFirst();
-
-            $restriction = ['min' => 1, 'max' => null, 'interval' => 1];
-            if ($productQuantityEntity !== null) {
-                $restriction = [
-                    'min' => $productQuantityEntity->getQuantityMin() === null ? 1 : $productQuantityEntity->getQuantityMin(),
-                    'max' => $productQuantityEntity->getQuantityMax(),
-                    'interval' => $productQuantityEntity->getQuantityInterval() === null ? 1 : $productQuantityEntity->getQuantityInterval(),
-                ];
-            }
-
-            $productQuantityRestrictionCollection[$productEntity->getSku()] = $restriction;
-        }
-
-        return $productQuantityRestrictionCollection;
-    }
-
-    /**
      * @param \Generated\Shared\Transfer\ItemTransfer $itemTransfer
+     * @param \Generated\Shared\Transfer\QuoteTransfer $quoteTransfer
      * @param \Generated\Shared\Transfer\CartPreCheckResponseTransfer $responseTransfer
      *
      * @return void
      */
-    protected function createViolationMessage(ItemTransfer $itemTransfer, CartPreCheckResponseTransfer $responseTransfer)
+    protected function validateItem(ItemTransfer $itemTransfer, QuoteTransfer $quoteTransfer, CartPreCheckResponseTransfer $responseTransfer)
     {
-        $message = (new MessageTransfer())
-            ->setValue('cart.error.quantity')
-            ->setParameters([]);
+        $quoteProductQuantity = $this->getQuoteProductQuantity($itemTransfer->getSku(), $quoteTransfer);
+        $productQuantity = $itemTransfer->getQuantity() + $quoteProductQuantity;
+
+        $this->validateItemQuantity($itemTransfer, $productQuantity, $responseTransfer);
+    }
+
+    /**
+     * @param \Generated\Shared\Transfer\ItemTransfer $itemTransfer
+     * @param int $productQuantity
+     * @param \Generated\Shared\Transfer\CartPreCheckResponseTransfer $responseTransfer
+     *
+     * @return void
+     */
+    protected function validateItemQuantity(ItemTransfer $itemTransfer, $productQuantity, CartPreCheckResponseTransfer $responseTransfer)
+    {
+        $productQuantityRestriction = $this->getProductQuantityRestrictionBySku($itemTransfer->getSku());
+
+        $min = $productQuantityRestriction['min'];
+        $max = $productQuantityRestriction['max'];
+        $interval = $productQuantityRestriction['interval'];
+
+        if ($productQuantity < $min) {
+            $this->createViolationMessage($responseTransfer);
+        }
+        if ($max !== null && $productQuantity > $max) {
+            $this->createViolationMessage($responseTransfer);
+        }
+        if (($productQuantity - $min) % $interval !== 0) {
+            $this->createViolationMessage($responseTransfer);
+        }
+    }
+
+    /**
+     * @param string $productSku
+     * @param \Generated\Shared\Transfer\QuoteTransfer $quoteTransfer
+     *
+     * @return int
+     */
+    protected function getQuoteProductQuantity($productSku, QuoteTransfer $quoteTransfer)
+    {
+        foreach ($quoteTransfer->getItems() as $quoteItemTransfer) {
+            if ($quoteItemTransfer->getSku() === $productSku) {
+                return $quoteItemTransfer->getQuantity();
+            }
+        }
+
+        return 0;
+    }
+
+    /**
+     * @param string $productSku
+     *
+     * @return array
+     */
+    protected function getProductQuantityRestrictionBySku($productSku)
+    {
+        $productQuantityRestriction = [
+            'min' => 1,
+            'max' => null,
+            'interval' => 1,
+        ];
+
+        /** @var \Orm\Zed\Product\Persistence\SpyProduct $productEntity */
+        $productEntity = SpyProductQuery::create()
+            ->filterBySku($productSku)
+            ->leftJoinWithSpyProductQuantity()
+            ->find()
+            ->getFirst();
+
+        if ($productEntity === null) {
+            return $productQuantityRestriction;
+        }
+
+        /** @var \Orm\Zed\ProductQuantity\Persistence\SpyProductQuantity $productQuantityEntity */
+        $productQuantityEntity = $productEntity->getSpyProductQuantities()->getFirst();
+
+        if ($productQuantityEntity === null) {
+            return $productQuantityRestriction;
+        }
+
+        return $this->normalizeProductQuantityRestriction($productQuantityEntity, $productQuantityRestriction);
+    }
+
+    /**
+     * @param \Orm\Zed\ProductQuantity\Persistence\SpyProductQuantity $productQuantityEntity
+     * @param array $productQuantityRestriction
+     *
+     * @return array
+     */
+    protected function normalizeProductQuantityRestriction(SpyProductQuantity $productQuantityEntity, array $productQuantityRestriction)
+    {
+        $productQuantityRestriction['min'] = $productQuantityEntity->getQuantityMin();
+        $productQuantityRestriction['max'] = $productQuantityEntity->getQuantityMax();
+        if ($productQuantityEntity->getQuantityInterval() !== null) {
+            $productQuantityRestriction['interval'] = $productQuantityEntity->getQuantityInterval();
+        }
+        if ($productQuantityRestriction['min'] === null) {
+            $productQuantityRestriction['min'] = $productQuantityRestriction['interval'];
+        }
+
+        return $productQuantityRestriction;
+    }
+
+    /**
+     * @param \Generated\Shared\Transfer\CartPreCheckResponseTransfer $responseTransfer
+     * @param array $parameters
+     *
+     * @return void
+     */
+    protected function createViolationMessage(CartPreCheckResponseTransfer $responseTransfer, array $parameters = [])
+    {
+        $message = new MessageTransfer();
+        $message->setValue('cart.error.quantity');
+        $message->setParameters($parameters);
 
         $responseTransfer->addMessage($message);
     }
